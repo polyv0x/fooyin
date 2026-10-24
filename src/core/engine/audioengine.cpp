@@ -630,6 +630,7 @@ void AudioEngine::setUpcomingTrackCandidate(const Engine::PlaybackItem& item)
 
     m_upcomingTrackCandidate       = track;
     m_upcomingTrackCandidateItemId = itemId;
+    updateCurrentStreamReadLimit();
     updateAutoCrossfadeAlbumMatch();
     m_autoAdvanceState.generation            = m_trackGeneration;
     m_autoAdvanceState.drainPrepareRequested = false;
@@ -3454,6 +3455,12 @@ void AudioEngine::handleTrackEndingSignals(const AudioStreamPtr& stream, uint64_
 
     rememberAutoTransitionMode(transitionModeBefore);
     rememberAutoTransitionMode(transitionMode);
+
+    // Short chapters may end before transition preparation runs
+    if(result.endReached && stream->readLimitReached() && effectiveAutoTransitionMode() == AutoTransitionMode::None) {
+        rememberAutoTransitionMode(configuredTrackEndAutoTransitionMode());
+    }
+
     maybeLogDrainFillPrepareGate(stream, result);
     maybePrepareUpcomingTrackForDrainFill(stream);
 
@@ -3506,8 +3513,9 @@ void AudioEngine::handleTrackEndingSignals(const AudioStreamPtr& stream, uint64_
     const StreamId audibleOutputStreamId = m_pipeline.audibleOutputStreamId();
     const bool preparedGaplessRenderedSafe
         = preparedGaplessRendered && audibleOutputStreamId == m_preparedGaplessTransition.streamId;
-    const bool currentStreamFullyDrained   = stream && stream->endOfInput() && stream->bufferEmpty();
-    const bool preparedGaplessStageReady   = currentStreamFullyDrained && preparedGaplessRendered;
+    // Read limits mark logical EOF while later chapters may still be buffered
+    const bool currentStreamEnded          = stream && stream->isEndOfStream();
+    const bool preparedGaplessStageReady   = currentStreamEnded && preparedGaplessRendered;
     const bool preparedGaplessReleaseReady = preparedGaplessRenderedSafe;
     const bool deferPreparedGaplessCommit  = gaplessBoundaryMode && preparedGaplessActive && !preparedGaplessRendered;
     const bool deferRenderedGaplessCommit
@@ -3540,7 +3548,7 @@ void AudioEngine::handleTrackEndingSignals(const AudioStreamPtr& stream, uint64_
     const bool boundedSegmentHandoffPending = cueBoundaryMode && hasDistinctUpcomingCandidate;
     bool boundedSegmentDrainDeadlineReached{false};
 
-    if(boundedSegmentHandoffPending && currentStreamFullyDrained && m_currentTrack.duration() > boundaryAudiblePosMs) {
+    if(boundedSegmentHandoffPending && currentStreamEnded && m_currentTrack.duration() > boundaryAudiblePosMs) {
         if(!m_autoAdvanceState.boundedSegmentDrainDeadline) {
             const auto outputSnapshot          = m_pipeline.outputQueueSnapshot();
             const uint64_t boundaryRemainderMs = m_currentTrack.duration() - boundaryAudiblePosMs;
@@ -4809,7 +4817,10 @@ void AudioEngine::updateCurrentStreamReadLimit()
         return;
     }
 
-    if(m_trackEndAutoTransitionEnabled || !isBoundedSegmentTrack(m_currentTrack) || m_currentTrack.duration() == 0) {
+    // Keep buffered audio from unselected chapters out of the output
+    const bool continuesSameStream
+        = m_trackEndAutoTransitionEnabled && isContiguousSameFileSegment(m_currentTrack, m_upcomingTrackCandidate);
+    if(continuesSameStream || !isBoundedSegmentTrack(m_currentTrack) || m_currentTrack.duration() == 0) {
         stream->clearReadLimit();
         return;
     }

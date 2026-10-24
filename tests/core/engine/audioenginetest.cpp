@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -57,6 +58,11 @@ using namespace Qt::StringLiterals;
 #endif
 
 namespace {
+constexpr double CurrentChapterSample{0.1};
+constexpr double SelectedNextSample{0.3};
+constexpr double UnselectedChapterSample{0.7};
+constexpr double ChapterSampleTolerance{0.01};
+
 struct DecoderStats
 {
     std::atomic<int> initCalls{0};
@@ -65,6 +71,9 @@ struct DecoderStats
     std::atomic<int> seekCalls{0};
     std::atomic<int> bitrate{320};
     std::atomic<uint64_t> sourceEndMs{0};
+    QString chapterFilePath;
+    uint64_t selectedChapterEndMs{0};
+    std::optional<uint64_t> selectedNextOffsetMs;
 };
 
 struct OutputStats
@@ -81,6 +90,9 @@ struct OutputStats
     std::atomic<int> freeFrames{256};
     std::atomic<int> queuedFrames{0};
     std::atomic<int> delayMs{0};
+    bool captureChapterAudio{false};
+    std::atomic<int> unselectedChapterFrames{0};
+    std::atomic<int> selectedNextFrames{0};
 
     void setOutputState(int free, int queued, int delay)
     {
@@ -363,7 +375,17 @@ public:
         auto* raw         = reinterpret_cast<double*>(buffer.data());
         const int samples = static_cast<int>(frameCount) * m_format.channelCount();
         for(int i{0}; i < samples; ++i) {
-            raw[i] = 0.1;
+            raw[i] = CurrentChapterSample;
+            if(!m_stats->chapterFilePath.isEmpty()) {
+                const uint64_t position = m_position + m_format.durationForFrames(i / m_format.channelCount());
+                if(m_track.filepath() != m_stats->chapterFilePath
+                   || (m_stats->selectedNextOffsetMs && position >= *m_stats->selectedNextOffsetMs)) {
+                    raw[i] = SelectedNextSample;
+                }
+                else if(position >= m_stats->selectedChapterEndMs) {
+                    raw[i] = UnselectedChapterSample;
+                }
+            }
         }
 
         m_position += m_format.durationForFrames(static_cast<int>(frameCount));
@@ -459,6 +481,24 @@ public:
             return 0;
         }
         ++m_stats->writeCalls;
+        if(m_stats->captureChapterAudio && m_format.sampleFormat() == SampleFormat::F64) {
+            const auto* pcm = reinterpret_cast<const double*>(data.data());
+            int unselectedFrames{0};
+            int selectedFrames{0};
+            for(int frame{0}; frame < frameCount; ++frame) {
+                const double sample = pcm[frame * m_format.channelCount()];
+                if(std::abs(sample - UnselectedChapterSample) < ChapterSampleTolerance) {
+                    ++unselectedFrames;
+                }
+                if(std::abs(sample - SelectedNextSample) < ChapterSampleTolerance) {
+                    ++selectedFrames;
+                }
+            }
+            m_stats->unselectedChapterFrames += unselectedFrames;
+            m_stats->selectedNextFrames += selectedFrames;
+            // Pace writes so playback timers follow the rendered audio
+            std::this_thread::sleep_for(std::chrono::milliseconds{m_format.durationForFrames(frameCount)});
+        }
         return frameCount;
     }
 
@@ -581,6 +621,12 @@ struct EngineHarness : EngineSettingsFixture
 class AudioEngineTestAccessor
 {
 public:
+    static StreamId activeStreamId(const AudioEngine& engine)
+    {
+        const auto stream = engine.m_decoder.activeStream();
+        return stream ? stream->id() : InvalidStreamId;
+    }
+
     static bool prepareNextTrackImmediate(AudioEngine& engine, const Engine::PlaybackItem& item,
                                           uint64_t prefillTargetMs)
     {
@@ -2302,6 +2348,99 @@ FOOYIN_AUDIOENGINE_SENSITIVE_TEST(AudioEngineTest, QueueLedUpcomingChangeDoesNot
     ASSERT_TRUE(
         pumpUntil([&harness]() { return AudioEngineTestAccessor::currentTrackItemId(harness.engine) == 4; }, 4000ms));
     EXPECT_FALSE(AudioEngineTestAccessor::currentTrackIsRemote(harness.engine));
+}
+
+namespace {
+enum class ChapterHandoff
+{
+    DifferentFile,
+    PreparedDifferentFile,
+    ShortChapter,
+    SkippedChapter,
+    ContiguousChapter,
+};
+
+void checkChapterBoundaryHandoff(ChapterHandoff handoff)
+{
+    ensureCoreApplication();
+    EngineHarness harness{false};
+    harness.settings.set<Settings::Core::GaplessPlayback>(true);
+    harness.decoderStats->sourceEndMs        = 20000;
+    harness.outputStats->captureChapterAudio = true;
+    harness.outputStats->setOutputState(20, 20, 20);
+
+    const uint64_t durationMs = handoff == ChapterHandoff::ShortChapter ? 1 : 2000;
+    Track currentTrack        = harness.createTrack(u"chapter-album.fyt"_s, 2000, durationMs);
+    currentTrack.setId(1001);
+    currentTrack.setCuePath(u"Embedded"_s);
+    harness.decoderStats->chapterFilePath      = currentTrack.filepath();
+    harness.decoderStats->selectedChapterEndMs = currentTrack.offset() + currentTrack.duration();
+
+    const bool contiguous = handoff == ChapterHandoff::ContiguousChapter;
+    const bool sameFile   = contiguous || handoff == ChapterHandoff::SkippedChapter;
+    Track nextTrack       = sameFile ? currentTrack : harness.createTrack(u"selected-next.fyt"_s, 0, 6000);
+    nextTrack.setId(1002);
+    if(sameFile) {
+        nextTrack.setOffset(harness.decoderStats->selectedChapterEndMs + (contiguous ? 0 : currentTrack.duration()));
+        harness.decoderStats->selectedNextOffsetMs = nextTrack.offset();
+    }
+
+    const auto currentItem = makePlaybackItem(currentTrack, 1);
+    const auto nextItem    = makePlaybackItem(nextTrack, 2);
+    harness.engine.loadTrack(currentItem, false);
+    ASSERT_TRUE(pumpUntil([&harness]() { return harness.engine.trackStatus() == Engine::TrackStatus::Loaded; }));
+    harness.engine.setUpcomingTrackCandidate(nextItem);
+    if(handoff == ChapterHandoff::PreparedDifferentFile) {
+        ASSERT_TRUE(AudioEngineTestAccessor::prepareNextTrackImmediate(harness.engine, nextItem, 250));
+    }
+
+    const auto currentStreamId   = AudioEngineTestAccessor::activeStreamId(harness.engine);
+    const int outputInitBefore   = harness.outputStats->initCalls.load();
+    const int outputUninitBefore = harness.outputStats->uninitCalls.load();
+    harness.engine.play();
+    ASSERT_TRUE(pumpUntil(
+        [&harness, &nextItem]() {
+            return AudioEngineTestAccessor::currentTrackItemId(harness.engine) == nextItem.itemId
+                && harness.outputStats->selectedNextFrames.load() >= 100;
+        },
+        7000ms))
+        << "current=" << AudioEngineTestAccessor::currentTrackItemId(harness.engine)
+        << " position=" << harness.engine.position()
+        << " targetFrames=" << harness.outputStats->selectedNextFrames.load();
+
+    if(contiguous) {
+        EXPECT_EQ(AudioEngineTestAccessor::activeStreamId(harness.engine), currentStreamId);
+        EXPECT_EQ(harness.outputStats->initCalls.load(), outputInitBefore);
+        EXPECT_EQ(harness.outputStats->uninitCalls.load(), outputUninitBefore);
+    }
+    harness.engine.stop();
+    EXPECT_EQ(harness.outputStats->unselectedChapterFrames.load(), 0);
+}
+} // namespace
+
+FOOYIN_AUDIOENGINE_SENSITIVE_TEST(AudioEngineTest, CueBoundaryDoesNotRenderUnselectedAlbumChapter)
+{
+    checkChapterBoundaryHandoff(ChapterHandoff::DifferentFile);
+}
+
+FOOYIN_AUDIOENGINE_SENSITIVE_TEST(AudioEngineTest, PreparedCueBoundaryDoesNotRenderUnselectedAlbumChapter)
+{
+    checkChapterBoundaryHandoff(ChapterHandoff::PreparedDifferentFile);
+}
+
+FOOYIN_AUDIOENGINE_SENSITIVE_TEST(AudioEngineTest, ShortCueChapterStillAdvancesAtReadLimit)
+{
+    checkChapterBoundaryHandoff(ChapterHandoff::ShortChapter);
+}
+
+FOOYIN_AUDIOENGINE_SENSITIVE_TEST(AudioEngineTest, SkippingCueChaptersDoesNotRenderSkippedChapter)
+{
+    checkChapterBoundaryHandoff(ChapterHandoff::SkippedChapter);
+}
+
+FOOYIN_AUDIOENGINE_SENSITIVE_TEST(AudioEngineTest, ContiguousCueChaptersKeepContinuousDecoder)
+{
+    checkChapterBoundaryHandoff(ChapterHandoff::ContiguousChapter);
 }
 
 FOOYIN_AUDIOENGINE_SENSITIVE_TEST(AudioEngineTest, NonCueTracksDoNotForceEndAtMetadataDurationBoundary)
